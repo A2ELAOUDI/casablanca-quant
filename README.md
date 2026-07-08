@@ -28,6 +28,38 @@ produit : un **top 10 d'actions par trimestre avec les raisons de chaque choix**
 des **prévisions de 1 mois à 1 an** avec leur incertitude, et un **portefeuille**
 aux poids optimisés. Le tout piloté depuis un dashboard.
 
+## Pourquoi la Bourse de Casablanca ? Un peu de théorie
+
+L'**hypothèse d'efficience des marchés** (Fama, 1970) affirme que les prix intègrent
+à tout instant l'ensemble de l'information publique disponible : si c'est vrai,
+aucune stratégie basée sur cette information ne peut battre durablement le marché
+après coûts — les cours suivent une marche aléatoire, et le passé ne dit rien sur
+l'avenir. C'est le théorème fondamental contre lequel tout quant se bat.
+
+Empiriquement, cette hypothèse est *approximativement* vraie sur les grands marchés
+très arbitrés (New York, Londres, Tokyo) : des milliers de fonds systématiques y
+traquent la moindre inefficience, et en la tradant, la font disparaître. Mais elle
+est *fréquemment violée* sur les **marchés frontières**, et pour des raisons
+structurelles précises :
+
+- **faible couverture par les analystes** : l'information circule lentement, les
+  prix mettent des jours ou des semaines à l'intégrer (source de momentum) ;
+- **flux dominé par les particuliers et les institutionnels locaux** : biais
+  comportementaux (sur-réaction, ancrage, effet de disposition) non arbitrés ;
+- **absence d'arbitrageurs systématiques** : personne pour corriger les anomalies ;
+- **contraintes structurelles** : pas de vente à découvert (impossible de parier à
+  la baisse, donc les mauvaises nouvelles s'intègrent lentement), seuils de variation
+  journaliers (les grands mouvements s'étalent sur plusieurs séances — de
+  l'autocorrélation mécanique).
+
+La Bourse de Casablanca (~75 valeurs, indice MASI) présente exactement ce profil.
+C'est l'opportunité. La contrepartie : une liquidité fine (beaucoup de valeurs ne
+traitent pas chaque séance) et des coûts de transaction élevés (~1 % l'aller simple,
+courtage + spread) qui condamnent les stratégies à rotation rapide. L'enjeu
+quantitatif du projet est donc double : **détecter l'inefficience** (étape 1) et
+**vérifier qu'elle reste exploitable net de frictions** (étapes 2 et 3) — une
+anomalie qui ne survit pas aux coûts n'est pas une opportunité, c'est un mirage.
+
 ## ⚠️ Ce n'est que le début — le projet a besoin de données
 
 **État actuel : un seul titre chargé (Managem, ~740 séances).** Or toute la puissance
