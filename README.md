@@ -1,189 +1,288 @@
 # Casablanca Quant Lab
 
-**Un laboratoire de recherche quantitative pour la Bourse de Casablanca.**
+**Laboratoire de recherche quantitative pour la Bourse de Casablanca (CSE)** —
+ingestion des historiques de cours, tests d'efficience de marché, bibliothèque de
+facteurs backtestés sous frictions réalistes, moteur de prévision par ensemble
+d'apprentissage avec validation purgée, allocation Hierarchical Risk Parity, et
+dashboard de pilotage.
 
-## C'est quoi ce projet ?
+Le principe directeur est celui des fonds quantitatifs systématiques : **aucun signal
+n'est déployé s'il ne survit pas à une batterie de tests conçus pour le détruire**
+(coûts de transaction, correction du data-snooping, déflation du Sharpe). Le système
+préfère dire « pas de signal » que d'halluciner de l'alpha.
 
-La question de départ est simple : *la bourse marocaine est-elle prédictible, et si
-oui, comment en profiter intelligemment ?*
+---
 
-Les grands fonds quantitatifs (Renaissance Technologies, Two Sigma, Citadel...) ne
-« devinent » pas les cours. Ils font trois choses, systématiquement :
+## 1. Motivation
 
-1. **mesurer** si le marché contient de la structure exploitable (inefficiences) ;
-2. **tester** des stratégies candidates dans des conditions brutalement réalistes
-   (coûts, liquidité, aucune information du futur) ;
-3. **refuser** de trader tout signal qui ne survit pas aux tests statistiques —
-   parce que le pire ennemi d'un quant, c'est de se mentir à soi-même avec un
-   backtest trop beau.
+L'hypothèse d'efficience des marchés (Fama, 1970) prédit qu'aucune stratégie basée
+sur l'information publique ne bat durablement le marché après coûts. Empiriquement,
+cette hypothèse est *approximativement* vraie sur les grands marchés très arbitrés,
+et *fréquemment violée* sur les marchés frontières : faible couverture par les
+analystes, flux dominé par des investisseurs particuliers et institutionnels locaux,
+absence d'arbitrageurs systématiques, contraintes structurelles (pas de vente à
+découvert, seuils de variation journaliers).
 
-Ce projet reproduit cette discipline, adaptée à la réalité de la Bourse de
-Casablanca : marché frontière peu arbitré (donc potentiellement inefficient — c'est
-une opportunité), mais liquidité fine, pas de vente à découvert, et des coûts de
-transaction élevés qui tuent les stratégies trop actives.
+La Bourse de Casablanca (~75 valeurs cotées, MASI) présente exactement ce profil.
+La contrepartie : liquidité fine (de nombreuses valeurs ne traitent pas chaque
+séance) et coûts de transaction élevés (~1 % aller simple courtage + spread), qui
+condamnent toute stratégie à rotation rapide. L'enjeu quantitatif est donc double :
+**détecter l'inefficience** et **vérifier qu'elle est exploitable net de frictions**.
 
-Concrètement, le lab prend des historiques de cours (fichiers Excel de la Bourse de
-Casablanca), les nettoie, mesure l'inefficience du marché, backteste une bibliothèque
-de stratégies, entraîne un moteur de prévision par apprentissage automatique, propose
-un **top 10 d'actions par trimestre avec les raisons de chaque choix**, des
-**prévisions de 1 mois à 1 an** avec leur marge d'incertitude, et construit un
-**portefeuille** aux poids optimisés. Le tout piloté depuis un dashboard.
+## 2. Architecture du pipeline
 
-## ⚠️ Ce n'est que le début — le projet a besoin de données
+```
+Excel/CSV (exports CSE)
+   └─ ingest.py    → panel long normalisé (date, ticker, OHLCV, cours ajusté)
+        └─ audit.py     → le marché dévie-t-il de la marche aléatoire ?
+        └─ signals.py   → scores factoriels S_k(t, i), strictement point-in-time
+             └─ backtest.py → rendements nets walk-forward + inférence statistique
+        └─ alpha.py     → E[r_{t→t+h}] par ensemble ML, validation purgée
+             └─ portfolio.py → poids HRP sous contraintes de liquidité
+                  └─ app/streamlit_app.py → dashboard
+```
 
-**L'état actuel : un seul titre est chargé (Managem).** Or toute la puissance de
-l'approche est *cross-sectionnelle* : comparer ~75 valeurs de la cote entre elles à
-chaque date pour repérer lesquelles sont en avance ou en retard. Avec une seule
-action, le moteur tourne mais se limite à de l'analyse de tendance ; avec toute la
-cote, il peut vraiment travailler :
+## 3. Données
 
-- l'audit dira **combien de titres rejettent la marche aléatoire** (la carte des
-  inefficiences du marché marocain) ;
-- le classement top 10 trimestriel aura un **vrai backtest** (paniers comparés à
-  l'univers, trimestre après trimestre) ;
-- les modèles apprendront sur ~35 000 observations (75 titres × 500 séances) au lieu
-  de 700.
+L'ingestion reconnaît automatiquement les exports officiels de la Bourse de
+Casablanca (`Séance`, `Ticker`, `Cours ajusté`, `Ouverture`, `+haut/+bas du jour`,
+`Nombre de titres échangés`, ...), les formats long et large, les nombres français
+et les multi-feuilles Excel. Le **cours ajusté** (corrigé des dividendes et
+opérations sur titres) est systématiquement préféré au cours brut : les rendements
+calculés sur cours non ajustés sont biaisés à chaque détachement.
 
-**Comment contribuer / améliorer : déposer les exports de cours des autres valeurs de
-la cote dans `data/raw/`** (même format que les exports officiels de la Bourse de
-Casablanca, un fichier par valeur ou tout dans un seul fichier), puis relancer le
-pipeline. Plus l'historique est long et large, plus les conclusions sont fiables.
+Les rendements sont logarithmiques : $r_{i,t} = \ln(P_{i,t}/P_{i,t-1})$, avec
+report avant (forward-fill) plafonné à 10 séances pour les valeurs non traitées, et
+un indicateur `traded` pour distinguer vrai rendement nul et absence d'échange.
 
-## Installation et démarrage
+**État actuel : un seul titre chargé (Managem).** Toute l'approche cross-sectionnelle
+(section 6) nécessite l'univers complet — voir la feuille de route.
+
+## 4. Audit d'efficience (`audit.py`)
+
+### 4.1 Variance ratio de Lo-MacKinlay (1988)
+
+Sous marche aléatoire, la variance des rendements agrégés sur $q$ périodes croît
+linéairement : $\mathrm{Var}(r_t^{(q)}) = q\,\mathrm{Var}(r_t)$. Le test mesure la
+déviation :
+
+$$VR(q) = \frac{\mathrm{Var}(r_t + \dots + r_{t-q+1})}{q\,\mathrm{Var}(r_t)}$$
+
+$VR > 1$ signale de l'autocorrélation positive (momentum), $VR < 1$ de la réversion.
+L'implémentation utilise la statistique **robuste à l'hétéroscédasticité** $z^*(q)$,
+où la variance de $VR$ est estimée par
+
+$$\hat\theta(q) = \sum_{k=1}^{q-1}\left[\frac{2(q-k)}{q}\right]^2 \hat\delta_k,
+\qquad
+\hat\delta_k = \frac{\sum_t (r_t-\bar r)^2 (r_{t-k}-\bar r)^2}{\left[\sum_t (r_t-\bar r)^2\right]^2 / n}$$
+
+ce qui rend le test valide sous volatilité stochastique (clustering GARCH), omniprésente
+sur actions.
+
+### 4.2 Ljung-Box
+
+$Q = n(n+2)\sum_{k=1}^{h} \frac{\hat\rho_k^2}{n-k} \sim \chi^2_h$ sous l'hypothèse
+nulle d'absence d'autocorrélation jusqu'au retard $h$ (ici $h=10$).
+
+### 4.3 Spread momentum cross-sectionnel
+
+Test direct de Jegadeesh-Titman : à chaque date de formation, classement par
+$\ln(P_{t-21}/P_{t-126})$, puis rendement moyen à 21 jours du quintile supérieur
+moins le quintile inférieur, sur des périodes **non chevauchantes** (t-stat de
+Student sur la série des spreads). C'est la matière première du facteur momentum,
+mesurée sans machinerie de backtest.
+
+## 5. Bibliothèque factorielle et backtest (`signals.py`, `backtest.py`)
+
+### 5.1 Définition des facteurs
+
+Chaque facteur est une fonction $S_k : (t, i) \mapsto \mathbb{R}$ n'utilisant que
+l'information $\mathcal{F}_t$ :
+
+| Facteur | Définition | Référence |
+|---|---|---|
+| `momentum_126_21` | $\ln(P_{t-21}/P_{t-126})$ | Jegadeesh & Titman (1993) |
+| `reversal_5d` | $-\sum_{s=t-4}^{t} r_s$ | Jegadeesh (1990) |
+| `low_volatility` | $-\hat\sigma_{63}$ (écart-type roulant) | Ang et al. (2006) |
+| `high_52w` | $P_t / \max_{s \in [t-252, t]} P_s$ | George & Hwang (2004) |
+| `amihud_illiquidity` | $\ln\!\big(1 + \overline{|r|/\mathrm{Vol}^{MAD}}_{63} \cdot 10^6\big)$ | Amihud (2002) |
+| `abnormal_volume` | $\ln(\overline{V}_5 / \overline{V}_{63})$ | Gervais et al. (2001) |
+| `trend_ma_20_100` | $MA_{20}/MA_{100} - 1$ | Moskowitz et al. (2012) |
+| `composite` | moyenne des z-scores cross-sectionnels des facteurs cœurs | — |
+
+### 5.2 Moteur d'exécution
+
+Portefeuille long-only (la VAD n'existe pas à la CSE) : à chaque rebalancement
+(défaut : 5 séances), poids égaux sur le quantile supérieur (20 %) des titres
+**éligibles** (≥ 60 % de séances traitées sur 63 jours, volume médian ≥ 50 000 MAD).
+Le rendement net s'écrit :
+
+$$r_{p,t} = \mathbf{w}_{t-1}^\top \mathbf{r}_t \;-\; c \cdot \|\mathbf{w}_{t-1} - \mathbf{w}_{t-2}\|_1$$
+
+avec $c = 100$ pb par côté (paramétrable). Le décalage $\mathbf{w}_{t-1}$ impose
+l'exécution à la clôture de $t\!+\!1$ : **aucune information contemporaine n'entre
+dans la décision**.
+
+### 5.3 Inférence : les quatre portes
+
+Un facteur n'est éligible à la production que s'il franchit les quatre tests.
+
+1. **Sharpe net positif** : $\widehat{SR} = \hat\mu / \hat\sigma \cdot \sqrt{252} > 0$.
+
+2. **Surperformance bootstrap** : IC à 95 % (2 000 rééchantillonnages) sur la moyenne
+   des rendements actifs $r_{p,t} - r_{bench,t}$ contre le baseline equal-weight
+   soumis aux mêmes frictions ; on exige $CI_{5\%} > 0$.
+
+3. **Reality Check de White (2000)** : soit $\bar f_k$ la moyenne des rendements
+   actifs du facteur $k$. La statistique $V = \max_k \sqrt{n}\,\bar f_k$ est comparée
+   à sa distribution sous $H_0$ obtenue par bootstrap par blocs mobiles
+   (blocs de 10 jours, recentrage $\bar f_k^* - \bar f_k$). Ce test répond à la
+   question que le p-value individuel ignore : *« après avoir essayé $K$ stratégies,
+   quelle est la probabilité que la meilleure paraisse aussi bonne par pur hasard ? »*
+
+4. **Deflated Sharpe Ratio** (Bailey & López de Prado, 2014) :
+
+$$DSR = \Phi\!\left(\frac{\widehat{SR} - SR^*}{\sqrt{\frac{1 - \hat\gamma_3 \widehat{SR} + \frac{\hat\gamma_4 - 1}{4}\widehat{SR}^2}{n-1}}}\right)$$
+
+   où $SR^*$ est l'espérance du maximum de $K$ Sharpe sous $H_0$ (approximation
+   Gumbel via $E[\max] \approx (1-\gamma)\Phi^{-1}(1-\tfrac1K) + \gamma\,\Phi^{-1}(1-\tfrac1{Ke})$,
+   $\gamma$ constante d'Euler-Mascheroni), et $\hat\gamma_3, \hat\gamma_4$ les
+   skewness et kurtosis empiriques — la non-normalité des rendements gonfle la
+   variance du Sharpe estimé et doit être pénalisée. Seuil retenu : $DSR > 0.90$.
+
+Échec à une porte ⇒ verdict : **baseline equal-weight**. Sur données synthétiques de
+validation, le système refuse correctement de déployer (les coûts de 100 pb
+détruisent les facteurs à rotation rapide — comportement attendu et souhaité).
+
+## 6. Moteur alpha (`alpha.py`)
+
+### 6.1 Problème d'apprentissage
+
+Cible : $y_{i,t}^{(h)} = \ln(P_{i,t+h}/P_{i,t})$ pour $h \in \{21, 63, 126, 252\}$
+jours. Features $\mathbf{x}_{i,t} \in \mathbb{R}^{12}$ : momentum (3 horizons),
+réversion 5 j, volatilités (niveau et ratio court/long), distance au plus-haut 52
+semaines, illiquidité d'Amihud, choc de volume, bêta roulant 63 j vs marché
+equal-weight, momentum et volatilité du marché (features de régime).
+
+Prédicteur : moyenne d'un **Ridge** ($\alpha=10$, features standardisées) et d'un
+**HistGradientBoosting** (profondeur 3, 120 itérations, lr 0.05, régularisation L2).
+La combinaison linéaire + arbres couvre les composantes additives et les
+interactions/non-linéarités, avec des profils d'erreur décorrélés.
+
+### 6.2 Validation walk-forward purgée avec embargo (López de Prado, 2018)
+
+Les cibles à horizon $h$ se **chevauchent** sur $h$ jours : une validation croisée
+naïve fait fuiter l'information du test vers le train et produit des IC massivement
+gonflés. Protocole appliqué : à chaque date de réentraînement $T$ (cadence 42 j),
+le train est restreint aux observations dont la **fenêtre de cible est intégralement
+antérieure** à $T$ (purge + embargo), la prédiction porte sur $[T, T+42)$.
+
+### 6.3 Compétence mesurée et rétrécissement des prévisions
+
+Compétence hors échantillon = **information coefficient** : corrélation de rang de
+Spearman entre prédiction et réalisé, calculée par date en cross-section (t-stat sur
+la série des IC), en repli sur l'IC poolé temporel avec taille effective
+$n_{\mathrm{eff}} \approx n/21$ si l'univers est trop étroit.
+
+La prévision publiée est **rétrécie vers le marché** proportionnellement au skill
+prouvé :
+
+$$\hat y_{\mathrm{final}} = \mu_M + \lambda\,(\hat y_{\mathrm{modèle}} - \mu_M),
+\qquad \lambda = \mathrm{clip}(5 \cdot IC_{OOS},\; 0,\; 0.5)$$
+
+où $\mu_M$ est le rendement moyen du marché à l'horizon considéré. Conséquence
+structurelle : $IC \le 0 \Rightarrow \lambda = 0$ — un horizon sans skill démontré
+publie le rendement de marché, et l'affiche. Les intervalles (5 %/95 %) proviennent
+des quantiles des **résidus hors échantillon**, pas d'une hypothèse gaussienne.
+
+### 6.4 Régimes de marché
+
+Mélange gaussien à 2 composantes sur les rendements quotidiens du marché ; l'état
+courant (CALME/STRESS) est la moyenne des probabilités a posteriori sur 21 jours.
+En régime de stress, corrélations et queues s'épaississent et le momentum se dégrade
+— information affichée à côté de toute recommandation.
+
+### 6.5 Évaluation à la cadence d'investissement réelle
+
+Backtest trimestriel du top 10 : toutes les 63 séances hors échantillon, panier des
+10 meilleures prévisions vs moyenne de l'univers ; t-stat sur la série des excès
+trimestriels. C'est la métrique qui correspond à une utilisation « j'investis chaque
+trimestre dans 10 valeurs ».
+
+## 7. Allocation : Hierarchical Risk Parity (`portfolio.py`)
+
+Markowitz requiert l'inversion de la covariance — numériquement instable quand
+$T/N$ est faible. Deux remèdes combinés :
+
+1. **Covariance Ledoit-Wolf (2004)** : $\hat\Sigma = \delta F + (1-\delta) S$,
+   rétrécissement optimal (minimisation MSE) de la covariance empirique $S$ vers une
+   cible structurée $F$, avec intensité $\delta$ estimée des données.
+
+2. **HRP (López de Prado, 2016)**, sans aucune inversion :
+   - distance de corrélation $d_{ij} = \sqrt{\tfrac12(1 - \rho_{ij})}$, clustering
+     hiérarchique (single linkage) ;
+   - quasi-diagonalisation : réordonnancement des titres selon les feuilles du
+     dendrogramme ;
+   - **bisection récursive** : à chaque scission, le budget de risque est réparti
+     entre les deux sous-clusters en proportion inverse de leur variance
+     ($w \propto 1/\sigma^2_{cluster}$, variance de cluster au portefeuille
+     inverse-variance interne).
+
+Contraintes finales : 12 % maximum par ligne, position plafonnée à 3 jours de volume
+médian en dirhams (contrainte d'impact), repli inverse-volatilité si l'HRP est
+indisponible. Si aucun facteur n'a passé les portes de la section 5.3, l'allocation
+porte sur l'univers liquide entier.
+
+## 8. Dashboard
+
+`python -m streamlit run app/streamlit_app.py` — six onglets : Marché (cours ajusté,
+MM50, volumes, performances), Top 10 (avec attribution des raisons par valeur),
+Prévisions (1M→12M avec intervalles et poids de confiance), Modèles (Sharpe par
+facteur, portes, IC par horizon), Audit, Portefeuille (allocation HRP, export CSV).
+Bouton « Tout analyser » = pipeline complet.
+
+## 9. Utilisation
 
 ```bash
 pip install -e .
 
-# 1. Déposer les fichiers Excel/CSV de cours dans data/raw/
-# 2. Pipeline complet : ingestion → audit → backtest → alpha → portefeuille
-python -m casablanca_quant.cli all --capital 100000
-# 3. Dashboard
-python -m streamlit run app/streamlit_app.py
+python -m casablanca_quant.cli ingest      # lit data/raw/
+python -m casablanca_quant.cli audit
+python -m casablanca_quant.cli backtest --cost-bps 100 --rebalance-days 5
+python -m casablanca_quant.cli alpha
+python -m casablanca_quant.cli portfolio --capital 100000
+python -m casablanca_quant.cli all         # tout enchaîner
+python -m casablanca_quant.cli demo        # marché synthétique de validation
+python -m pytest tests/ -q                 # 12 tests (lookahead, parsing, coûts, HRP...)
 ```
 
-Pas encore de données ? `python -m casablanca_quant.cli demo` génère un marché
-synthétique (échanges clairsemés, seuils de variation, momentum injecté) pour tester
-toute la chaîne.
+## 10. Limites actuelles et feuille de route
 
-## Les données acceptées
+Le point critique est la **donnée**. Un seul titre est chargé : l'intégralité de la
+couche cross-sectionnelle (IC par date, top 10 backtesté, Reality Check sur univers
+réel) attend l'historique des ~75 valeurs de la cote.
 
-L'ingestion reconnaît automatiquement les exports officiels de la Bourse de
-Casablanca : colonnes `Séance`, `Ticker`, `Cours ajusté` (préféré au cours brut car
-corrigé des dividendes et splits), `Ouverture`, `+haut/+bas du jour`, `Nombre de
-titres échangés`... Elle gère aussi le format « large » (une colonne par valeur), les
-nombres français (`1 234,56`), les dates `jj/mm/aaaa`, plusieurs fichiers et
-plusieurs feuilles Excel. Sortie : `data/processed/prices.csv`.
+- [ ] **Univers complet CSE (~75 valeurs)** — priorité absolue : passe de ~700 à
+      ~35 000 observations d'apprentissage
+- [ ] Profondeur d'historique 5-10 ans (les horizons 6M/12M manquent d'échantillons
+      hors chevauchement)
+- [ ] Features fondamentales (PER, rendement du dividende, flottant, secteur)
+- [ ] Indice MASI comme benchmark de marché explicite (au lieu du proxy equal-weight)
+- [ ] Journal de production : recommandations horodatées vs réalisé (tracking error
+      du lab lui-même)
 
-## Les modèles, expliqués simplement
+## Références
 
-### Étape 1 — L'audit : le marché est-il prédictible ? (`audit`)
-
-| Test | Question posée |
-|---|---|
-| **Variance ratio (Lo-MacKinlay)** | Les cours suivent-ils une marche aléatoire ? VR > 1 = les tendances persistent (momentum), VR < 1 = les cours sur-réagissent puis reviennent (mean reversion) |
-| **Ljung-Box** | Les rendements d'aujourd'hui dépendent-ils de ceux d'hier ? |
-| **Spread momentum** | Les gagnants des 6 derniers mois battent-ils les perdants le mois suivant ? |
-| **Carte de liquidité** | Sur quelles valeurs peut-on réellement trader sans bouger le cours ? |
-
-### Étape 2 — Les stratégies candidates (`backtest`)
-
-Dix familles issues de la littérature académique et de la pratique des fonds, choisies
-pour leur pertinence en marché frontière :
-
-| Facteur | Idée |
-|---|---|
-| `momentum_126_21` / `momentum_63_10` | Acheter ce qui monte depuis 3-6 mois (en sautant le dernier mois, qui sur-réagit) |
-| `reversal_5d` / `reversal_21d` | Acheter ce qui vient de baisser : la sur-réaction des particuliers se corrige |
-| `low_volatility` | Les valeurs calmes rapportent plus par unité de risque (anomalie documentée mondialement) |
-| `high_52w` | Les valeurs proches de leur plus-haut 52 semaines continuent de dériver vers le haut (ancrage psychologique) |
-| `amihud_illiquidity` | Les valeurs illiquides paient une prime de rendement pour compenser |
-| `abnormal_volume` | Un volume inhabituel signale l'arrivée d'information avant son plein effet sur le prix |
-| `trend_ma_20_100` | Suivi de tendance classique par croisement de moyennes mobiles |
-| `composite` | Moyenne des signaux ci-dessus, standardisés |
-
-Le moteur de backtest est volontairement impitoyable : signal du jour t exécuté à la
-clôture de **t+1** (aucune information du futur), **long-only** (pas de vente à
-découvert à la CSE), filtre de liquidité, et **100 points de base de coûts par côté**
-prélevés sur chaque rotation du portefeuille. Une stratégie qui a l'air géniale sans
-coûts et qui meurt avec — c'est le backtest qui a raison.
-
-### Étape 3 — Les quatre portes statistiques
-
-Un facteur n'est déployé en production que s'il passe **les quatre** :
-
-1. Sharpe net de coûts positif ;
-2. bat le portefeuille equal-weight (le « marché ») avec un intervalle de confiance
-   bootstrap à 95 % ;
-3. **Reality Check de White** : quand on essaie 10 stratégies, la meilleure a l'air
-   bonne par pur hasard — ce test bootstrap corrige exactement ce biais ;
-4. **Sharpe déflaté** (Bailey & López de Prado) > 0.90 : la probabilité que le Sharpe
-   observé soit réel compte tenu du nombre d'essais effectués.
-
-Sinon, verdict : rester sur le baseline. Un système qui ne sait pas dire « non » perd
-de l'argent.
-
-### Étape 4 — Le moteur alpha : prévisions par apprentissage automatique (`alpha`)
-
-- 12 **features point-in-time** par (date, valeur) : momentum multi-horizons,
-  reversal, volatilité, distance au plus-haut 52 semaines, illiquidité, chocs de
-  volume, bêta, état du marché ;
-- **ensemble de modèles** (régression Ridge + Gradient Boosting) — deux familles
-  d'erreurs différentes, moyennées ;
-- **validation walk-forward purgée avec embargo** (López de Prado) : l'entraînement ne
-  voit jamais de données dont la cible chevauche la période de test. C'est LA
-  technique qui sépare un backtest honnête d'un backtest illusoire ;
-- **prévisions rétrécies par la compétence prouvée** : le modèle mesure son propre
-  skill hors échantillon (information coefficient) ; sans skill démontré, ses
-  prévisions collent au rendement moyen du marché **et l'affichent**. Pas de fausse
-  confiance ;
-- **horizons 1M / 3M / 6M / 12M** avec fourchettes pire cas / meilleur cas ;
-- **détection de régime** (calme vs stress) par mélange gaussien ;
-- **top 10 trimestriel** avec, pour chaque valeur, les raisons de sa sélection.
-
-### Étape 5 — Le portefeuille (`portfolio`)
-
-**Hierarchical Risk Parity** (López de Prado) sur covariance **Ledoit-Wolf** : la
-méthode d'allocation robuste utilisée quand l'optimisation classique de Markowitz
-explose sur de petits échantillons. Garde-fous : 12 % maximum par ligne, 3 jours de
-volume médian maximum par position. Sortie : poids, montants en MAD, nombre d'actions.
-
-## Le dashboard
-
-Six onglets : **Marché** (cours, moyennes mobiles, volumes, performances), **Top 10**
-(le panier du trimestre et pourquoi chaque valeur y est), **Prévisions** (1 mois →
-1 an par valeur avec incertitude), **Modèles** (Sharpe par facteur, portes de
-déploiement, skill du moteur alpha), **Audit** (inefficience du marché),
-**Portefeuille** (allocation, export CSV). Bouton **« Tout analyser »** = pipeline
-complet en un clic.
-
-## Structure du code
-
-```
-src/casablanca_quant/
-├── ingest.py      # lecture Excel/CSV flexible + générateur synthétique
-├── audit.py       # tests d'efficience du marché
-├── signals.py     # bibliothèque de facteurs
-├── backtest.py    # moteur walk-forward + Reality Check + Sharpe déflaté
-├── alpha.py       # ensemble ML purgé, prévisions, régimes, top 10
-├── portfolio.py   # HRP + Ledoit-Wolf
-└── cli.py         # ligne de commande
-app/streamlit_app.py   # dashboard
-tests/                 # pytest (lookahead, parsing, coûts, HRP...)
-```
-
-## Feuille de route
-
-- [x] Ingestion des exports officiels CSE + générateur synthétique
-- [x] Audit d'efficience, 10 facteurs, 4 portes statistiques
-- [x] Moteur alpha multi-horizons + régimes + top 10 trimestriel
-- [x] Portefeuille HRP + dashboard
-- [ ] **Charger toute la cote (~75 valeurs)** ← la priorité absolue
-- [ ] Historique plus profond (5-10 ans) pour les horizons 6M/12M
-- [ ] Données fondamentales (PER, dividendes, flottant) comme features
-- [ ] Suivi en production : journal des recommandations vs réalisé
+- Lo, A., MacKinlay, C. (1988). *Stock Market Prices Do Not Follow Random Walks*. RFS.
+- Jegadeesh, N., Titman, S. (1993). *Returns to Buying Winners and Selling Losers*. JF.
+- Amihud, Y. (2002). *Illiquidity and Stock Returns*. JFM.
+- White, H. (2000). *A Reality Check for Data Snooping*. Econometrica.
+- Ledoit, O., Wolf, M. (2004). *A Well-Conditioned Estimator for Large-Dimensional Covariance Matrices*. JMVA.
+- Bailey, D., López de Prado, M. (2014). *The Deflated Sharpe Ratio*. JPM.
+- López de Prado, M. (2016). *Building Diversified Portfolios that Outperform Out-of-Sample* (HRP). JPM.
+- López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley.
 
 ## Avertissement
 
-Outil de recherche et d'aide à la décision — **pas un conseil en investissement**.
-Les performances passées ou simulées ne préjugent pas des performances futures.
-Investir en actions comporte un risque de perte en capital.
+Outil de recherche — pas un conseil en investissement. Les performances simulées ne
+préjugent pas des performances futures ; risque de perte en capital.
